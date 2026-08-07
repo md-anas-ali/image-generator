@@ -1,0 +1,7 @@
+# Procedural (no model weights) image generator. Deliberately minimal —
+# no torch, no onnxruntime, no transformers/optimum, no huggingface-hub.
+# See app/server.py module docstring for why those aren't needed anymore.
+fastapi==0.115.0
+uvicorn==0.32.0
+numpy==1.26.4
+pillow==10.4.0

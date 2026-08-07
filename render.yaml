@@ -1,0 +1,27 @@
+# Render.com Blueprint — deploy with the free plan.
+# Push this repo to GitHub, then in Render: New -> Blueprint -> pick the
+# repo. Render reads this file automatically and provisions the service
+# below on the free plan, no manual config needed.
+#
+# Render's free web services spin down after ~15 minutes with no
+# incoming HTTP traffic, and cold-start again on the next request (with
+# a delay). Point a free external uptime pinger (UptimeRobot,
+# cron-job.org, etc.) at the deployed URL's /health path every 5-10
+# minutes to keep it warm. Render's own healthCheckPath below is just
+# for Render's internal "is this instance alive" checks during deploys —
+# it does not by itself stop free-plan idle spin-down.
+services:
+  - type: web
+    name: tiny-image-gen
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: MAX_SIDE
+        value: "768"
+      - key: DEFAULT_SIDE
+        value: "512"
+      - key: CONCURRENCY_LIMIT
+        value: "2"
+      - key: SOFT_RSS_LIMIT_MB
+        value: "400"

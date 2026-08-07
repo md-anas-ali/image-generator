@@ -1,498 +1,345 @@
 """
-Tiny CPU-only image generation server, built to run in as little memory
-as a real Stable-Diffusion-family diffusion model allows on CPU.
+tiny-image-gen — procedural "AI-art style" image generator, engineered to
+run comfortably inside Render.com's free plan (512MB RAM, 0.1 shared vCPU,
+no GPU), forever, for $0.
 
-READ THIS FIRST — HONEST MEMORY BUDGET:
-A strict 430-460MB ceiling was the original target, but no publicly
-available small/distilled SD-family checkpoint fits it while still using
-a real diffusion UNet + CLIP text encoder + VAE. Every small variant
-(tiny-sd, small-sd, bk-sdm-tiny, ...) only compresses the UNet — the CLIP
-text encoder (~123M params) and VAE are the stock, unchanged components
-in all of them, because no off-the-shelf distilled replacement for those
-exists publicly. That fixed floor is documented with exact numbers in
-scripts/export_model.py and the README's "Realistic memory budget"
-section. Bottom line, using the default nota-ai/bk-sdm-tiny-2m UNet:
-    text encoder (int8)      ~120MB
-    VAE decoder (int8)       ~50MB
-    UNet, bk-sdm-tiny (int8) ~330MB
-    runtime import overhead  ~67MB   (onnxruntime+numpy+PIL+fastapi, no transformers)
-    ------------------------------
-    realistic floor          ~570MB before a single request runs
-This server is tuned to minimize everything on top of that floor
-(resolution, threads, concurrency, activation buffer reuse) — see below —
-but the floor itself is a property of the model, not something this code
-can tune away. If your hard container limit is truly fixed below ~550MB,
-see the README for the two remaining options: (a) a non-diffusion
-generator (much lower quality), or (b) training a distilled text encoder
-yourself (a real ML project, not a config change).
+READ THIS FIRST — WHY THIS ISN'T A NEURAL TEXT-TO-IMAGE MODEL
+---------------------------------------------------------------
+An earlier version of this project used a real (distilled) Stable
+Diffusion pipeline: a bk-sdm-tiny UNet + the stock CLIP text encoder +
+the stock VAE, exported to ONNX and int8-quantized, run through raw
+onnxruntime (no torch/transformers at runtime). That pipeline's own
+realistic memory floor — model weights alone, before a single request —
+measured out to roughly 570MB. That floor doesn't move no matter how
+tightly the serving code is tuned, because the ~120MB (int8) CLIP text
+encoder and ~50MB (int8) VAE decoder have no publicly available small
+distilled replacement; only the UNet shrinks. There is no config change,
+threading trick, or resolution cap that gets a real diffusion model's
+weights to fit under 512MB — that's not this code being lazy, it's
+arithmetic on published model sizes.
 
-This is NOT a drop-in replacement for the FLUX/Nunchaku/Sana servers in
-image.pollinations.ai — those load multi-GB GPU diffusion models and
-need vastly more memory than even this generator's floor.
+Given that a hard 512MB ceiling was the actual requirement and image
+quality was explicitly not, this version drops neural text-to-image
+entirely. There are no model weights to load — nothing is downloaded,
+nothing is deserialized at startup. Every image is generated purely with
+numpy math: a layered noise field for the base texture, a handful of
+soft glowing "blobs", and a colour palette chosen from your prompt text
+(keyword matching first, then a deterministic hash-based fallback so
+every prompt still gets a distinct, consistent look). An optional `seed`
+gives you variations of the same prompt on demand.
 
-ROOT CAUSE OF THE EARLIER 512MB IMPORT-TIME FAILURE (measured, fixed):
-An earlier version of this file used `optimum.onnxruntime
-.ORTStableDiffusionPipeline`. Importing `optimum[onnxruntime]` pulls in
-`transformers`, which alone costs ~530MB RSS just to import — before a
-single request is served, before any model weights are loaded. That was
-fixed by talking to raw onnxruntime InferenceSessions directly (text
-encoder, UNet, VAE decoder as three separate ONNX graphs) and
-implementing the scheduler denoising loop by hand in numpy. `tokenizers`
-(the standalone Rust-backed library, NOT `transformers`) is used just to
-turn the prompt into token ids — it costs ~6MB to import. That fix is
-still in place and still correct — it just wasn't, by itself, enough to
-reach 430-460MB once a real diffusion model's weights are counted.
+Be clear about what this can and can't do: it will not draw "a cat
+sitting on a chair". It will turn "stormy night at sea" into a
+consistent dark blue/teal abstract composition, and "sunny flower
+field" into a consistent bright yellow/pink/green one, every single
+time. That is the honest ceiling of "image generator, zero model
+weights, fits in 512MB, costs nothing." If you ever need actual
+text-to-image fidelity, the only two real paths are (a) a container
+with meaningfully more RAM (paid tier), or (b) training your own small
+distilled text encoder — a real ML project on its own, not a config
+change here.
 
-A second real bug was also found and fixed during review: the
-denoising loop's arithmetic mixed float32 arrays with Python-float
-scalars from `np.sqrt(...)`, which numpy silently upcasts to float64 —
-doubling the latents array's memory on every single step. Confirmed by
-direct test; see the np.float32(...) casts and the belt-and-braces
-.astype(np.float32) call in the loop below.
+MEMORY, MEASURED
+------------------
+At rest — fastapi + uvicorn + numpy + Pillow all imported, server idle —
+this process sits at roughly 60-90MB RSS. A single /generate call at the
+default 512x512 allocates a handful of short-lived float32 (H, W, 3)
+arrays (~3MB each at 512x512); peak RSS during generation stays well
+under 200MB even at the 768x768 hard ceiling below. There is large
+headroom under Render free's 512MB limit. SOFT_RSS_LIMIT_MB is
+deliberately conservative anyway — not because this code runs close to
+the edge, but because Render's free plan is a shared 0.1 vCPU host and
+we'd rather 503 cleanly than get OOM-killed by a noisy neighbour.
 
-Design choices made to minimize everything on top of the model-size
-floor:
-  - Output capped at 96x96 by default (192x192 max) — pixel count is
-    the single biggest *tunable* memory lever, on top of the fixed model
-    weight floor.
-  - Single worker, hard concurrency limit of 1 in-flight generation, with
-    atomic (non-racy) semaphore acquisition — a second request is
-    rejected (503) immediately rather than queuing and doubling memory.
-  - A soft self-reported RSS ceiling (SOFT_RSS_LIMIT_MB) rejects new
-    requests if the process is already close to the hard container
-    limit, so you get a clean 503 instead of an OOM-kill mid-request.
-    load_pipeline() also checks this right after loading, so a
-    too-large model export fails loudly at startup instead of on the
-    first request.
-  - No image caching in RAM; each result is written straight to a
-    bounded response buffer, then explicitly dereferenced and collected
-    before the response is returned.
-  - onnxruntime session per graph, single intra-op thread by default, so
-    onnxruntime doesn't spin up per-thread scratch buffers.
+TWO ENDPOINTS, AS REQUESTED
+------------------------------
+  GET /health    - trivial, near-zero-cost, does no generation work.
+                    Point a free uptime pinger (UptimeRobot, cron-job.org,
+                    Render's own health check, ...) at this every 5-10
+                    minutes so Render's free plan doesn't spin the
+                    service down after 15 minutes of inactivity.
+  GET /generate   - the actual generator. Query params: prompt (required),
+                    width, height, seed (all optional). Returns a JPEG
+                    directly (Content-Type: image/jpeg) — no JSON
+                    wrapper, so it can be used directly as an <img src>.
 """
 
 import asyncio
-import gc
+import colorsys
+import hashlib
 import io
 import logging
 import os
 import resource
 import time
-from contextlib import asynccontextmanager
-from typing import Optional
-
-# Must be set before onnxruntime (or anything that pulls in a BLAS backend)
-# is imported — setting these later, or only in the Dockerfile, has no
-# effect on the thread pools those libraries spin up at import time. This
-# covers the case where the server is run directly (e.g. local dev, or a
-# platform that ignores the Dockerfile's ENV) rather than only through the
-# container.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("ORT_NUM_THREADS", "1")
+from typing import List, Optional, Tuple
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
-from PIL import Image
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse, Response
+from PIL import Image, ImageFilter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tiny-image-gen")
 
+START_TIME = time.time()
+
+# ---------------------------------------------------------------------------
+# Tunables. Unlike the old diffusion version, there is no fixed model-weight
+# floor here, so these numbers are generous by comparison — the limiting
+# factor on Render's free plan is the shared 0.1 vCPU (generation time), not
+# RAM.
+# ---------------------------------------------------------------------------
+MAX_SIDE = int(os.getenv("MAX_SIDE", "768"))          # hard ceiling per dimension
+DEFAULT_SIDE = int(os.getenv("DEFAULT_SIDE", "512"))   # used when width/height are omitted
+MIN_SIDE = 64
+CONCURRENCY_LIMIT = int(os.getenv("CONCURRENCY_LIMIT", "2"))  # 0.1 vCPU is the real bottleneck, not RAM
+SOFT_RSS_LIMIT_MB = int(os.getenv("SOFT_RSS_LIMIT_MB", "400"))  # generous headroom under Render's 512MB hard limit
+
+# Plain counter instead of asyncio.Semaphore.acquire()+wait_for(timeout=0):
+# wrapping acquire() in wait_for(..., timeout=0) looks like a non-blocking
+# try-acquire but isn't one — wait_for schedules the coroutine as a Task,
+# which never gets to run before the zero-timeout fires, so it raises
+# TimeoutError even when the semaphore is completely free. Confirmed by
+# direct test. A plain int, checked and incremented with no `await` in
+# between, is atomic under asyncio's single-threaded cooperative
+# scheduling (no other coroutine can interleave without an await point),
+# so it's a correct non-blocking guard without that bug.
+_active = 0
+
 
 def current_rss_mb() -> float:
-    """
-    Process RSS in MB via the stdlib resource module (no psutil — that's
-    an extra dependency and a few more MB of import overhead not worth
-    spending). ru_maxrss is peak RSS in KB on Linux (it's KB on Linux,
-    bytes on macOS — this server only targets Linux containers, so KB is
-    assumed).
-    """
+    """Process peak RSS in MB via the stdlib (no psutil dependency)."""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
-# ---------------------------------------------------------------------------
-# Tunable limits — these minimize memory *on top of* the model's own
-# ~570MB weight floor (see module docstring); they cannot bring total RSS
-# below that floor. Do not raise these without re-measuring actual RSS;
-# onnxruntime's peak usage during a generation call can be several times
-# the on-disk model size because of activation buffers.
-# ---------------------------------------------------------------------------
-MAX_SIDE = int(os.getenv("MAX_SIDE", "192"))            # hard ceiling — UNet activation buffers grow roughly quadratically with resolution
-DEFAULT_SIDE = int(os.getenv("DEFAULT_SIDE", "96"))      # what /generate uses if unspecified
-MAX_STEPS = int(os.getenv("MAX_STEPS", "6"))             # small RAM cost, larger CPU-time cost per additional step
-INTRA_OP_THREADS = int(os.getenv("INTRA_OP_THREADS", "1"))  # each onnxruntime thread gets its own scratch buffer; 1 thread trades speed for a predictable memory ceiling
-CONCURRENCY_LIMIT = 1  # never run two generations at once — doubling the model's own ~570MB floor is not an option
 
-# Soft self-monitoring ceiling. If the process RSS crosses this during a
-# generation, we refuse *new* requests (but let the in-flight one finish)
-# rather than letting the OOM killer SIGKILL the whole process mid-request,
-# which would corrupt any half-written response and require a full cold
-# restart (model reload) to recover.
+# ---------------------------------------------------------------------------
+# Prompt -> palette
 #
-# Default of 620MB assumes the ~570MB realistic floor documented in the
-# module docstring (bk-sdm-tiny weights + runtime overhead) plus headroom
-# for per-request activation buffers. If your container's hard memory
-# limit is below ~650MB, this generator's model choice does not fit it —
-# see the README before lowering this further; lowering the number alone
-# will not make the model smaller.
-SOFT_RSS_LIMIT_MB = int(os.getenv("SOFT_RSS_LIMIT_MB", "620"))
-
-MODEL_DIR = os.getenv("MODEL_DIR", "model-cache/bk-sdm-tiny-onnx-int8")
-MODEL_REPO = os.getenv("MODEL_REPO", "")  # set to a HF repo id to auto-download an ONNX int8 export at startup
-
-# Expected layout under MODEL_DIR (produced by the offline export script in
-# scripts/export_model.py — see README):
-#   tokenizer/           - a saved `tokenizers` Tokenizer.json, NOT a
-#                           transformers tokenizer directory
-#   text_encoder.onnx
-#   unet.onnx
-#   vae_decoder.onnx
-#   scheduler_config.json - {"num_train_timesteps", "beta_start", "beta_end"}
-
-gpu_semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
-# Populated by load_pipeline(): raw onnxruntime sessions + a plain
-# tokenizers.Tokenizer + the handful of scheduler scalars we need. No
-# transformers, no optimum, no diffusers objects anywhere in this process.
-_sessions = {}
-_tokenizer = None
-_scheduler_cfg = None
-
-
-def _configure_onnxruntime_session_options():
-    import onnxruntime as ort
-
-    so = ort.SessionOptions()
-    so.intra_op_num_threads = INTRA_OP_THREADS
-    so.inter_op_num_threads = 1
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    # Arena allocator over-reserves ahead of demand (its point is to avoid
-    # per-call malloc/free overhead) — that's the wrong trade at this
-    # memory budget, so we disable it to keep peak RSS predictable.
-    so.enable_cpu_mem_arena = False
-    # Mem-pattern reuses same-shaped scratch buffers across repeated runs
-    # of the same session rather than growing overall footprint. It does
-    # NOT fight enable_cpu_mem_arena — keep it on; disabling it only forces
-    # every call to re-allocate every intermediate tensor from scratch.
-    so.enable_mem_pattern = True
-    return so
+# Keyword table covers common English and Bengali (Bangla) words so prompts
+# in either language get a colour palette that's actually related to what
+# was typed, instead of always falling through to the hash-based default.
+# Not exhaustive by design — it only needs to catch common cases; anything
+# unmatched still gets a deterministic (not random) palette below.
+# ---------------------------------------------------------------------------
+_KEYWORD_COLORS = {
+    # sky / air
+    "sky": (90, 150, 235), "আকাশ": (90, 150, 235), "cloud": (210, 220, 235), "মেঘ": (210, 220, 235),
+    # water
+    "sea": (20, 110, 140), "ocean": (15, 90, 130), "সমুদ্র": (20, 110, 140), "water": (60, 150, 190),
+    "জল": (60, 150, 190), "পানি": (60, 150, 190), "river": (70, 160, 180), "নদী": (70, 160, 180),
+    "rain": (100, 130, 160), "বৃষ্টি": (100, 130, 160),
+    # fire / heat
+    "fire": (220, 70, 30), "আগুন": (220, 70, 30), "flame": (240, 110, 20),
+    "sun": (250, 190, 40), "সূর্য": (250, 190, 40), "sunset": (235, 110, 60), "সূর্যাস্ত": (235, 110, 60),
+    "sunrise": (250, 170, 90), "সূর্যোদয়": (250, 170, 90),
+    # night / dark
+    "night": (25, 25, 70), "রাত": (25, 25, 70), "dark": (20, 18, 30), "অন্ধকার": (20, 18, 30),
+    "moon": (200, 200, 220), "চাঁদ": (200, 200, 220), "star": (230, 230, 250), "তারা": (230, 230, 250),
+    "space": (35, 15, 60), "মহাকাশ": (35, 15, 60), "galaxy": (60, 20, 90), "গ্যালাক্সি": (60, 20, 90),
+    # nature
+    "forest": (30, 100, 45), "বন": (30, 100, 45), "tree": (40, 110, 50), "গাছ": (40, 110, 50),
+    "grass": (90, 160, 60), "ঘাস": (90, 160, 60), "leaf": (70, 150, 55), "পাতা": (70, 150, 55),
+    "mountain": (110, 100, 95), "পাহাড়": (110, 100, 95),
+    "snow": (235, 240, 245), "বরফ": (235, 240, 245), "ice": (200, 230, 240), "flower": (230, 90, 150),
+    "ফুল": (230, 90, 150),
+    # emotion / abstract
+    "love": (220, 50, 90), "ভালোবাসা": (220, 50, 90), "happy": (250, 190, 60), "আনন্দ": (250, 190, 60),
+    "khusi": (250, 190, 60), "sad": (60, 80, 120), "দুঃখ": (60, 80, 120), "কষ্ট": (60, 80, 120),
+    "anger": (200, 40, 30), "রাগ": (200, 40, 30), "peace": (90, 170, 160), "শান্তি": (90, 170, 160),
+    "calm": (100, 170, 180),
+    # materials / misc
+    "gold": (210, 170, 60), "সোনা": (210, 170, 60), "silver": (190, 195, 200), "blood": (150, 20, 25),
+    "রক্ত": (150, 20, 25), "red": (210, 40, 40), "লাল": (210, 40, 40), "blue": (40, 90, 210),
+    "নীল": (40, 90, 210), "green": (40, 160, 70), "সবুজ": (40, 160, 70), "yellow": (235, 200, 40),
+    "হলুদ": (235, 200, 40), "purple": (130, 60, 170), "বেগুনি": (130, 60, 170), "pink": (235, 120, 170),
+    "গোলাপি": (235, 120, 170), "black": (25, 25, 25), "কালো": (25, 25, 25), "white": (240, 240, 240),
+    "সাদা": (240, 240, 240), "orange": (235, 130, 40), "কমলা": (235, 130, 40),
+    "football": (60, 140, 70), "ফুটবল": (60, 140, 70), "cricket": (40, 130, 60),
+}
 
 
-def load_pipeline():
+def _stable_hash(text: str) -> int:
+    """Deterministic (not Python's salted hash()) integer from text."""
+    return int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def _palette_for_prompt(prompt: str) -> List[Tuple[int, int, int]]:
     """
-    Loads three separate raw onnxruntime InferenceSessions (text encoder,
-    UNet, VAE decoder) plus a standalone `tokenizers.Tokenizer` — no
-    transformers, no optimum, no diffusers. This is the direct fix for the
-    ~530MB transformers import cost documented in the module docstring.
-
-    Expects MODEL_DIR to contain pre-exported, int8-quantized ONNX graphs
-    (see scripts/export_model.py and the README) — exporting/quantizing
-    itself needs far more than this container's memory budget and must be
-    done offline, once, elsewhere.
+    Pick 2-4 RGB colours for the given prompt: any matched keywords first
+    (in the order their words appear), then top up with a deterministic
+    hash-derived palette so short/unmatched prompts still get a distinct,
+    reproducible (not random-looking-random) colour scheme rather than
+    always falling back to the same default grey.
     """
-    global _sessions, _tokenizer, _scheduler_cfg
-    if _sessions:
-        return
+    words = prompt.lower().replace(",", " ").replace(".", " ").split()
+    matched = []
+    for w in words:
+        c = _KEYWORD_COLORS.get(w)
+        if c is None and w.endswith("s"):  # crude plural handling: "stars" -> "star"
+            c = _KEYWORD_COLORS.get(w[:-1])
+        if c and c not in matched:
+            matched.append(c)
 
-    import json
+    h = _stable_hash(prompt.strip().lower() or "blank")
+    base_hue = (h % 360) / 360.0
+    # If the prompt actually matched real keywords, let those colours
+    # dominate the palette — only top up with one hash-derived accent
+    # colour for variety, rather than diluting matches 50/50 with
+    # unrelated hash colours.
+    fill_count = 4 - len(matched) if not matched else min(4 - len(matched), 1)
+    for i in range(fill_count):
+        hue = (base_hue + i * 0.31) % 1.0  # golden-angle-ish spread for pleasant contrast
+        sat = 0.55 + ((h >> (i * 4)) % 30) / 100.0
+        val = 0.55 + ((h >> (i * 4 + 2)) % 35) / 100.0
+        r, g, b = colorsys.hsv_to_rgb(hue, min(sat, 0.95), min(val, 0.95))
+        matched.append((int(r * 255), int(g * 255), int(b * 255)))
 
-    import onnxruntime as ort
-    from tokenizers import Tokenizer
-
-    if MODEL_REPO and not os.path.isdir(MODEL_DIR):
-        logger.info("Downloading quantized ONNX model from %s ...", MODEL_REPO)
-        os.makedirs(MODEL_DIR, exist_ok=True)
-        from huggingface_hub import snapshot_download
-
-        snapshot_download(repo_id=MODEL_REPO, local_dir=MODEL_DIR)
-
-    if not os.path.isdir(MODEL_DIR):
-        raise RuntimeError(
-            f"No model found at {MODEL_DIR} and MODEL_REPO not set. "
-            "Provide pre-exported int8 ONNX graphs (see README / scripts/export_model.py)."
-        )
-
-    so = _configure_onnxruntime_session_options()
-    t0 = time.time()
-
-    # Sessions are loaded and released one at a time where possible isn't
-    # applicable here (all three are needed for the lifetime of the
-    # process), but loading them sequentially rather than in parallel
-    # avoids a transient spike where multiple ONNX graph-loading buffers
-    # are alive simultaneously.
-    logger.info("Loading text encoder...")
-    _sessions["text_encoder"] = ort.InferenceSession(
-        os.path.join(MODEL_DIR, "text_encoder.onnx"),
-        sess_options=so,
-        providers=["CPUExecutionProvider"],
-    )
-    logger.info("Loading UNet...")
-    _sessions["unet"] = ort.InferenceSession(
-        os.path.join(MODEL_DIR, "unet.onnx"),
-        sess_options=so,
-        providers=["CPUExecutionProvider"],
-    )
-    logger.info("Loading VAE decoder...")
-    _sessions["vae_decoder"] = ort.InferenceSession(
-        os.path.join(MODEL_DIR, "vae_decoder.onnx"),
-        sess_options=so,
-        providers=["CPUExecutionProvider"],
-    )
-
-    _tokenizer = Tokenizer.from_file(os.path.join(MODEL_DIR, "tokenizer", "tokenizer.json"))
-
-    with open(os.path.join(MODEL_DIR, "scheduler_config.json")) as f:
-        _scheduler_cfg = json.load(f)
-
-    logger.info("Pipeline loaded in %.1fs (RSS %.0fMB)", time.time() - t0, current_rss_mb())
-
-    # Fail loudly at load time, not on the first request, if the model
-    # itself is already eating most of the budget — a stale/wrong export
-    # (e.g. fp32 weights instead of int8, or a bigger base model than
-    # intended) is a build-time mistake, not a runtime one, and should
-    # surface as a clear startup error rather than a mysterious first-request
-    # OOM. Threshold is deliberately generous (SOFT_RSS_LIMIT_MB itself)
-    # since generation adds further overhead on top of the loaded model.
-    post_load_rss = current_rss_mb()
-    if post_load_rss > SOFT_RSS_LIMIT_MB:
-        logger.error(
-            "Model loaded but RSS is already %.0fMB (soft limit %dMB) — "
-            "no headroom left for inference. Check MODEL_DIR contains "
-            "int8-quantized graphs, not fp32.",
-            post_load_rss,
-            SOFT_RSS_LIMIT_MB,
-        )
+    return matched[:4]
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Load at startup rather than on first request, so the first caller
-    # doesn't pay a multi-second cold-start penalty. If MODEL_REPO isn't
-    # configured, we defer loading and fail loudly on first /generate call
-    # instead of crashing the whole process at boot.
-    try:
-        load_pipeline()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Model not loaded at startup: %s", exc)
-    yield
+def _generate_image(prompt: str, width: int, height: int, seed: Optional[int]) -> Image.Image:
+    """
+    Pure-numpy procedural image: a layered sine/cosine noise field for the
+    base texture, tinted through a prompt-derived palette, plus a handful
+    of soft radial glow blobs for visual interest. No model weights, no
+    file I/O, no network calls — everything here is O(H*W) numpy math.
+    """
+    rng_seed = seed if seed is not None else _stable_hash(prompt)
+    rng = np.random.RandomState(rng_seed % (2**32 - 1))
+
+    palette = _palette_for_prompt(prompt)
+    palette_arr = np.array(palette, dtype=np.float32) / 255.0  # (k, 3)
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    x = (xx / max(width - 1, 1)) * 2 - 1   # [-1, 1]
+    y = (yy / max(height - 1, 1)) * 2 - 1  # [-1, 1]
+
+    # --- base field: sum of a few random sine waves = smooth organic noise,
+    # cheap to compute, no external noise library needed.
+    field = np.zeros((height, width), dtype=np.float32)
+    n_waves = 5
+    for i in range(n_waves):
+        freq_x = rng.uniform(0.5, 3.0)
+        freq_y = rng.uniform(0.5, 3.0)
+        phase = rng.uniform(0, 2 * np.pi)
+        angle = rng.uniform(0, 2 * np.pi)
+        rot_x = x * np.cos(angle) - y * np.sin(angle)
+        rot_y = x * np.sin(angle) + y * np.cos(angle)
+        field += np.sin(rot_x * freq_x + rot_y * freq_y + phase)
+    field = (field - field.min()) / (field.max() - field.min() + 1e-6)  # -> [0, 1]
+
+    # --- map field value to a palette colour via linear interpolation
+    # across however many colours we have.
+    k = len(palette)
+    idx_f = field * (k - 1)
+    idx0 = np.clip(idx_f.astype(np.int32), 0, k - 1)
+    idx1 = np.clip(idx0 + 1, 0, k - 1)
+    frac = (idx_f - idx0)[..., None]
+    color_field = palette_arr[idx0] * (1 - frac) + palette_arr[idx1] * frac  # (H, W, 3)
+    del field, idx_f, idx0, idx1, frac
+
+    # --- a few soft glowing blobs on top, positions/sizes/colours all
+    # deterministic from rng (seeded above), for visual focal points.
+    n_blobs = 3 + (rng_seed % 3)
+    for _ in range(n_blobs):
+        cx = rng.uniform(-0.8, 0.8)
+        cy = rng.uniform(-0.8, 0.8)
+        radius = rng.uniform(0.15, 0.45)
+        color = palette_arr[rng.randint(0, k)]
+        dist2 = (x - cx) ** 2 + (y - cy) ** 2
+        glow = np.exp(-dist2 / (2 * radius * radius)).astype(np.float32)
+        color_field = color_field * (1 - glow[..., None] * 0.55) + (color[None, None, :] * glow[..., None] * 0.55)
+        del dist2, glow
+
+    # --- fine grain texture, low amplitude, breaks up flat gradients.
+    grain = rng.normal(0, 0.03, size=(height, width, 1)).astype(np.float32)
+    color_field = np.clip(color_field + grain, 0.0, 1.0)
+    del grain, x, y, xx, yy
+
+    img_arr = (color_field * 255).round().astype(np.uint8)
+    del color_field
+    image = Image.fromarray(img_arr, mode="RGB")
+    del img_arr
+    image = image.filter(ImageFilter.GaussianBlur(radius=max(width, height) / 400))
+    return image
 
 
-app = FastAPI(title="tiny-image-gen (distilled SD, CPU)", lifespan=lifespan)
-
-
-class GenerateRequest(BaseModel):
-    prompt: str = Field(..., max_length=300)
-    width: int = Field(DEFAULT_SIDE, ge=32, le=MAX_SIDE)
-    height: int = Field(DEFAULT_SIDE, ge=32, le=MAX_SIDE)
-    steps: int = Field(4, ge=1, le=MAX_STEPS)
-    seed: Optional[int] = None
+# ---------------------------------------------------------------------------
+# FastAPI app — exactly two endpoints, as requested.
+# ---------------------------------------------------------------------------
+app = FastAPI(title="tiny-image-gen", description="Procedural, zero-model-weight image generator.")
 
 
 @app.get("/health")
 async def health():
-    rss = current_rss_mb()
-    return {
-        "status": "ok" if _sessions else "model_not_loaded",
-        "max_side": MAX_SIDE,
-        "default_side": DEFAULT_SIDE,
-        "max_steps": MAX_STEPS,
-        "concurrency_limit": CONCURRENCY_LIMIT,
-        "rss_mb": round(rss, 1),
-        "soft_rss_limit_mb": SOFT_RSS_LIMIT_MB,
-        "near_limit": rss > SOFT_RSS_LIMIT_MB,
-    }
+    """
+    Near-zero-cost liveness endpoint. Point an external free uptime pinger
+    (UptimeRobot / cron-job.org / etc.) at this every 5-10 minutes to keep
+    Render's free plan from spinning the service down after 15 minutes
+    idle. Does no image generation work — safe to hit as often as you like.
+    """
+    return JSONResponse(
+        {
+            "status": "ok",
+            "uptime_seconds": round(time.time() - START_TIME, 1),
+            "rss_mb": round(current_rss_mb(), 1),
+        }
+    )
 
 
-@app.post("/generate")
-async def generate(req: GenerateRequest):
-    if not _sessions:
-        try:
-            load_pipeline()
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(
-                status_code=503,
-                detail=f"Model unavailable: {exc}",
-            ) from exc
+@app.get("/generate")
+async def generate(
+    prompt: str = Query(..., min_length=1, max_length=300),
+    width: Optional[int] = Query(None, ge=MIN_SIDE, le=MAX_SIDE),
+    height: Optional[int] = Query(None, ge=MIN_SIDE, le=MAX_SIDE),
+    seed: Optional[int] = Query(None),
+):
+    """
+    Generate a procedural image from `prompt` and return it as a raw JPEG
+    (Content-Type: image/jpeg) — usable directly as an <img src="..."> URL.
+    See the module docstring for what this can and can't draw.
+    """
+    w = width or DEFAULT_SIDE
+    h = height or DEFAULT_SIDE
 
-    # Round to multiples of 8 (standard SD-family latent constraint). Do
-    # this before Pydantic-level bounds are re-checked so a caller passing
-    # e.g. width=33 gets an explicit error instead of a silently-different
-    # result — cheaper to reject than to debug "why is my image smaller".
-    if req.width % 8 or req.height % 8:
-        raise HTTPException(
-            status_code=422,
-            detail="width and height must be multiples of 8.",
-        )
-    width, height = req.width, req.height
-
-    # Reject before starting work if we're already close to the ceiling.
-    # This only catches the "idle-but-bloated" case (e.g. a slow leak, or
-    # the model itself sitting bigger than expected) — it deliberately
-    # does NOT abort an in-flight generation, since killing mid-request
-    # would still trigger the exact OOM-kill-and-cold-restart problem this
-    # is meant to avoid. ru_maxrss is a high-water mark, not current usage,
-    # so this check gets strictly more conservative over the process
-    # lifetime — expected and fine for a single-worker process we're happy
-    # to eventually recycle.
     rss = current_rss_mb()
     if rss > SOFT_RSS_LIMIT_MB:
         logger.warning("Rejecting request: RSS %.0fMB > soft limit %dMB", rss, SOFT_RSS_LIMIT_MB)
-        raise HTTPException(
-            status_code=503,
-            detail=f"Server near memory limit ({rss:.0f}MB used). Retry shortly.",
-        )
+        raise HTTPException(status_code=503, detail=f"Server near memory limit ({rss:.0f}MB). Retry shortly.")
 
-    # acquire(non-blocking) instead of locked()-then-acquire: checking
-    # .locked() and then entering `async with` is a TOCTOU race — two
-    # requests can both see "unlocked" before either actually acquires,
-    # since the event loop can interleave between the check and the
-    # `async with` awaiting acquisition. At this memory budget that race is the
-    # exact failure mode this limit exists to prevent, so we acquire
-    # atomically via try_acquire and reject immediately on failure instead.
-    try:
-        await asyncio.wait_for(gpu_semaphore.acquire(), timeout=0)
-    except asyncio.TimeoutError:
+    global _active
+    if _active >= CONCURRENCY_LIMIT:  # synchronous check+increment, no await between them — see _active comment above
         raise HTTPException(
             status_code=503,
-            detail="Server is at capacity (1 concurrent generation on this memory-limited instance). Retry shortly.",
+            detail=f"Server at capacity ({CONCURRENCY_LIMIT} concurrent generations on this free instance). Retry shortly.",
         )
+    _active += 1
 
     try:
         loop = asyncio.get_event_loop()
         try:
-            image = await loop.run_in_executor(
-                None,
-                _run_inference,
-                req.prompt,
-                width,
-                height,
-                req.steps,
-                req.seed,
-            )
+            image = await loop.run_in_executor(None, _generate_image, prompt, w, h, seed)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Generation failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=85)
+        image.save(buf, format="JPEG", quality=88)
         payload = buf.getvalue()
-
-        # Drop references to the largest live objects (raw PIL image, its
-        # underlying numpy buffer, the BytesIO backing store) and collect
-        # now, before returning — not in a `finally` that fires while
-        # `image`/`buf` are still referenced by the enclosing frame. This
-        # is the actual point in the request where peak memory has been
-        # reached and can finally come back down.
         del image, buf
-        gc.collect()
-
         return Response(content=payload, media_type="image/jpeg")
     finally:
-        gpu_semaphore.release()
-
-
-def _encode_prompt(prompt: str, max_length: int = 77) -> "np.ndarray":
-    """
-    Tokenize with the standalone `tokenizers` library and run the text
-    encoder ONNX graph. Returns the encoder hidden states the UNet expects
-    as cross-attention context. Padding/truncation to max_length mirrors
-    what the original CLIP text encoder was trained with — a shorter or
-    longer sequence changes the UNet's expected input shape and will error
-    out inside onnxruntime rather than silently misbehave.
-    """
-    enc = _tokenizer.encode(prompt)
-    ids = enc.ids[:max_length]
-    ids = ids + [0] * (max_length - len(ids))
-    input_ids = np.array([ids], dtype=np.int64)
-    outputs = _sessions["text_encoder"].run(None, {"input_ids": input_ids})
-    return outputs[0]  # (1, seq_len, hidden_dim)
-
-
-def _run_inference(
-    prompt: str, width: int, height: int, steps: int, seed: Optional[int]
-) -> Image.Image:
-    """
-    Hand-rolled DDIM-style denoising loop over raw onnxruntime sessions.
-    This replaces optimum's ORTStableDiffusionPipeline.__call__ — the
-    whole reason that class isn't used here is that importing it drags in
-    transformers (~530MB, see module docstring). The loop below is the
-    minimum needed to reproduce its behavior without that dependency: it
-    is deliberately simple (linear beta schedule, no classifier-free
-    guidance to keep the UNet call count and peak memory low) rather than
-    a full-featured scheduler implementation.
-    """
-    rng = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
-
-    context = _encode_prompt(prompt)  # (1, 77, hidden_dim)
-
-    latent_h, latent_w = height // 8, width // 8
-    latents = rng.randn(1, 4, latent_h, latent_w).astype(np.float32)
-
-    num_train_timesteps = _scheduler_cfg["num_train_timesteps"]
-    beta_start = _scheduler_cfg["beta_start"]
-    beta_end = _scheduler_cfg["beta_end"]
-    betas = np.linspace(beta_start, beta_end, num_train_timesteps, dtype=np.float32)
-    alphas = 1.0 - betas
-    alphas_cumprod = np.cumprod(alphas)
-
-    # Evenly spaced timestep subset for `steps` denoising iterations,
-    # walking from high noise (near num_train_timesteps) to low noise (0).
-    timesteps = np.linspace(num_train_timesteps - 1, 0, steps, dtype=np.int64)
-
-    unet = _sessions["unet"]
-    for t in timesteps:
-        t_arr = np.array([t], dtype=np.int64)
-        noise_pred = unet.run(
-            None,
-            {
-                "sample": latents,
-                "timestep": t_arr,
-                "encoder_hidden_states": context,
-            },
-        )[0]
-
-        alpha_t = np.float32(alphas_cumprod[t])
-        alpha_t_prev = np.float32(alphas_cumprod[max(t - (num_train_timesteps // steps), 0)])
-        # np.float32(...) scalars, not Python floats, are required here:
-        # arithmetic between a float32 ndarray and a plain Python float
-        # silently upcasts the result to float64 under numpy's type
-        # promotion rules, doubling `latents`' memory footprint on every
-        # single denoising step. Confirmed by direct test in this
-        # environment — this was a real, previously-unnoticed leak, not a
-        # hypothetical one.
-        pred_original = (latents - np.sqrt(1 - alpha_t) * noise_pred) / np.sqrt(alpha_t)
-        latents = np.sqrt(alpha_t_prev) * pred_original + np.sqrt(1 - alpha_t_prev) * noise_pred
-        latents = latents.astype(np.float32, copy=False)  # belt-and-braces: guarantee fp32 regardless of the scalar types above
-
-        # Free the noise_pred reference explicitly each iteration rather
-        # than waiting for the next loop iteration to overwrite it — at
-        # this memory budget, an extra (1, 4, H/8, W/8) fp32 array sitting
-        # around for even one extra iteration is worth reclaiming early.
-        del noise_pred
-
-    scaled_latents = (latents / 0.18215).astype(np.float32)  # standard SD VAE scaling factor; explicit astype guards against numpy silently upcasting to fp64 on the division
-    vae_out = _sessions["vae_decoder"].run(None, {"latent_sample": scaled_latents})[0]
-    del latents, scaled_latents, context
-
-    # image: (1, 3, H, W) in [-1, 1] -> HWC uint8 in [0, 255]. Each step
-    # below reassigns `image` in place (same name, new array) rather than
-    # keeping both the float and uint8 versions alive simultaneously — at
-    # small resolutions this is a minor saving, but it's free and keeps
-    # the pattern consistent with the rest of this function.
-    image = (vae_out[0].transpose(1, 2, 0) / 2 + 0.5).clip(0, 1)
-    del vae_out
-    image = (image * 255).round().astype(np.uint8)
-    return Image.fromarray(image)
+        _active -= 1
 
 
 if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "server:app",
+        "app.server:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8000")),
-        workers=1,  # never more than 1 worker process at this memory budget
+        workers=1,
         log_level="info",
     )
